@@ -35,6 +35,12 @@ const (
 	DefaultTokenURL        = "https://auth.docker.io/token?service=registry.docker.io"
 	DefaultRegistryBaseURL = "https://registry.hub.docker.com"
 	DefaultUserAgent       = "github.com/aybabtme/oci/source/docker"
+
+	// mediaTypeManifestV1 specifies the mediaType for the current version. Note
+	// that for schema version 1, the the media is optionally "application/json".
+	mediaTypeManifestV1 = "application/vnd.docker.distribution.manifest.v1+json"
+	// mediaTypeManifestV2 specifies the mediaType for the current version.
+	mediaTypeManifestV2 = "application/vnd.docker.distribution.manifest.v2+json"
 )
 
 var (
@@ -209,9 +215,14 @@ func (reg *Registry) do(ctx context.Context, op string, req *http.Request, v int
 		_ = json.NewDecoder(resp.Body).Decode(apiErr)
 		return false, apiErr
 	}
-	if resp.Header.Get(registryVersionHeader) != registryVersionValue {
-		return false, errInvalidTargetServer
+
+	// if we're not redirected, check proper API version
+	if resp.Request.Host == req.Host && resp.Header.Get("Content-Type") != "application/octet-stream" {
+		if resp.Header.Get(registryVersionHeader) != registryVersionValue {
+			return false, errInvalidTargetServer
+		}
 	}
+
 	switch vt := v.(type) {
 	case io.Writer:
 		_, err := io.Copy(vt, resp.Body)
@@ -252,22 +263,64 @@ func (reg *Registry) CheckVersion(ctx context.Context) error {
 	return nil
 }
 
-type ImageManifest map[string]interface{}
-
 func (reg *Registry) GetImageManifest(ctx context.Context, name, tag string) (*ImageManifest, bool, error) {
-	out := new(ImageManifest)
 	path := path.Join(name, "manifests", tag)
 	scope := strings.Join([]string{
 		"repository",
 		name,
 		"pull",
 	}, ":")
-	if found, err := reg.rt(ctx, "GetImageManifest", "GET", path, scope, nil, out); err != nil {
+
+	outBytes := bytes.NewBuffer(nil)
+	if found, err := reg.rt(ctx, "GetImageManifest", "GET", path, scope, nil, outBytes); err != nil {
 		return nil, false, err
 	} else if !found {
 		return nil, false, nil
 	}
-	return out, true, nil
+
+	v1Schema := new(ImageManifestV1)
+	v2Schema := new(ImageManifestV2)
+	v1err := json.Unmarshal(outBytes.Bytes(), v1Schema)
+	v2err := json.Unmarshal(outBytes.Bytes(), v2Schema)
+
+	if v1err != nil && v2err != nil {
+		return nil, false, v1err
+	}
+
+	if v1Schema.SchemaVersion != v2Schema.SchemaVersion {
+		return nil, false, errors.New("invalid schema version")
+	}
+
+	version := v1Schema.SchemaVersion
+	switch version {
+	case 1:
+		return &ImageManifest{Name: name, Tag: tag, V1: v1Schema}, true, v1err
+
+	case 2:
+		return &ImageManifest{Name: name, Tag: tag, V2: v2Schema}, true, v2err
+
+	default:
+		return nil, false, errors.New("invalid schema version")
+	}
+}
+
+func (reg *Registry) GetImageLayer(ctx context.Context, name string, dg Digest, w io.Writer) (bool, error) {
+	path := path.Join(name, "blobs", string(dg))
+	scope := strings.Join([]string{
+		"repository",
+		name,
+		"pull",
+	}, ":")
+
+	var (
+		found bool
+		err   error
+	)
+	err = validateContent(dg, w, func(checkedW io.Writer) error {
+		found, err = reg.rt(ctx, "GetImageLayer", "GET", path, scope, nil, checkedW)
+		return err
+	})
+	return found, err
 }
 
 // details
@@ -323,19 +376,29 @@ func (d Digest) sum() ([]byte, error) {
 	return hex.DecodeString(parts[1])
 }
 
-func computeDigest(alg DigestAlg, src io.Reader, thru func(r io.Reader) error) (Digest, error) {
+func validateContent(dg Digest, w io.Writer, thru func(w io.Writer) error) error {
+	if err := dg.Validate(); err != nil {
+		return err
+	}
+	alg := dg.Alg()
 	var h hash.Hash
 	switch alg {
 	case DigestAlgSHA256:
 		h = sha256.New()
 	default:
-		return "", errors.New("unsupported digest algorithm")
+		return errors.New("unsupported digest algorithm")
 	}
-	if err := thru(io.TeeReader(src, h)); err != nil {
-		return "", err
+
+	if err := thru(io.MultiWriter(w, h)); err != nil {
+		return err
 	}
-	sum := hex.EncodeToString(h.Sum(nil))
-	return Digest(string(alg) + ":" + sum), nil
+	got := Digest(string(alg) + ":" + hex.EncodeToString(h.Sum(nil)))
+
+	if got != dg {
+		return errors.New("received content doesn't match expected digest")
+	}
+
+	return nil
 }
 
 func parsePathComponents(repo string) ([]string, error) {

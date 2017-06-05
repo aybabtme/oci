@@ -2,9 +2,13 @@ package docker
 
 import (
 	"context"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/aybabtme/iocontrol"
+	"github.com/dustin/go-humanize"
 )
 
 func TestRegistry(t *testing.T) {
@@ -39,7 +43,20 @@ func TestRegistry(t *testing.T) {
 					t.Fatal(err)
 				} else {
 					t.Errorf("found=%+v", found)
-					t.Fatalf("img=%+v", img)
+					t.Errorf("img=%+v", img)
+
+					for _, layer := range img.Layers() {
+						msw := iocontrol.NewMeasuredWriter(ioutil.Discard)
+						found, err := reg.GetImageLayer(ctx, "library/nginx", layer, msw)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if !found {
+							t.Errorf("not found")
+						} else {
+							t.Errorf("pulled layer of size %s", humanize.IBytes(uint64(msw.Total())))
+						}
+					}
 				}
 			},
 			wantPath: "/",
