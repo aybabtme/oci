@@ -6,11 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"hash"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -21,6 +21,7 @@ import (
 
 	"github.com/opentracing/opentracing-go"
 	otext "github.com/opentracing/opentracing-go/ext"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -136,12 +137,12 @@ func (reg *Registry) tracingOpName(op string) string {
 	return "docker/registry." + op
 }
 
-func (reg *Registry) newRequest(ctx context.Context, method, ref string, v interface{}) (*http.Request, error) {
+func (reg *Registry) newRequest(ctx context.Context, method, ref, scope string, v interface{}) (*http.Request, error) {
 	u, err := reg.resolveURL(ref)
 	if err != nil {
 		return nil, err
 	}
-	token, err := reg.tokenStore.Get(ctx)
+	token, err := reg.tokenStore.Get(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -181,16 +182,18 @@ func (reg *Registry) newRequest(ctx context.Context, method, ref string, v inter
 	return req, nil
 }
 
-func (reg *Registry) do(ctx context.Context, op string, req *http.Request, v interface{}) error {
+func (reg *Registry) do(ctx context.Context, op string, req *http.Request, v interface{}) (bool, error) {
 	span, ctx := opentracing.StartSpanFromContext(ctx, reg.tracingOpName(op), otext.SpanKindRPCClient)
 	defer span.Finish()
 
 	otext.HTTPMethod.Set(span, req.Method)
 	otext.HTTPUrl.Set(span, req.URL.String())
 
+	log.Printf(req.URL.String())
+
 	resp, err := reg.client.Do(req)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
 
@@ -200,20 +203,20 @@ func (reg *Registry) do(ctx context.Context, op string, req *http.Request, v int
 	case http.StatusOK:
 		// all is good, continue
 	case http.StatusNotFound:
-		return errInvalidTargetServer
+		return false, nil
 	default:
 		apiErr := &apiErrorBody{Code: resp.StatusCode}
 		_ = json.NewDecoder(resp.Body).Decode(apiErr)
-		return apiErr
+		return false, apiErr
 	}
 	if resp.Header.Get(registryVersionHeader) != registryVersionValue {
-		return errInvalidTargetServer
+		return false, errInvalidTargetServer
 	}
 	switch vt := v.(type) {
 	case io.Writer:
 		_, err := io.Copy(vt, resp.Body)
 		if err != nil {
-			return err
+			return false, err
 		}
 	case nil:
 		// discard the content to be able to reuse conns, but only
@@ -222,16 +225,16 @@ func (reg *Registry) do(ctx context.Context, op string, req *http.Request, v int
 		_, _ = io.Copy(ioutil.Discard, io.LimitReader(resp.Body, 1<<20))
 	default:
 		if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return true, nil
 }
 
-func (reg *Registry) rt(ctx context.Context, op, method, ref string, in, out interface{}) error {
-	req, err := reg.newRequest(ctx, method, ref, in)
+func (reg *Registry) rt(ctx context.Context, op, method, ref, scope string, in, out interface{}) (bool, error) {
+	req, err := reg.newRequest(ctx, method, ref, scope, in)
 	if err != nil {
-		return err
+		return false, err
 	}
 	return reg.do(ctx, op, req, out)
 }
@@ -239,7 +242,32 @@ func (reg *Registry) rt(ctx context.Context, op, method, ref string, in, out int
 // actual API calls
 
 func (reg *Registry) CheckVersion(ctx context.Context) error {
-	return reg.rt(ctx, "CheckVersion", "GET", "", nil, nil)
+	ok, err := reg.rt(ctx, "CheckVersion", "GET", "", "", nil, nil)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errInvalidTargetServer
+	}
+	return nil
+}
+
+type ImageManifest map[string]interface{}
+
+func (reg *Registry) GetImageManifest(ctx context.Context, name, tag string) (*ImageManifest, bool, error) {
+	out := new(ImageManifest)
+	path := path.Join(name, "manifests", tag)
+	scope := strings.Join([]string{
+		"repository",
+		name,
+		"pull",
+	}, ":")
+	if found, err := reg.rt(ctx, "GetImageManifest", "GET", path, scope, nil, out); err != nil {
+		return nil, false, err
+	} else if !found {
+		return nil, false, nil
+	}
+	return out, true, nil
 }
 
 // details
@@ -357,7 +385,7 @@ type tokenStore struct {
 	mu            sync.Mutex
 	timeNow       func() time.Time
 	refreshBefore time.Duration
-	tok           *token
+	tok           map[string]*token
 }
 
 func newTokenStore(tokenURL *url.URL, client *http.Client) *tokenStore {
@@ -366,25 +394,45 @@ func newTokenStore(tokenURL *url.URL, client *http.Client) *tokenStore {
 		client:        client,
 		refreshBefore: 10 * time.Second,
 		timeNow:       time.Now,
+		tok:           make(map[string]*token),
 	}
 }
 
-func (tokStor *tokenStore) Get(ctx context.Context) (string, error) {
+func (tokStor *tokenStore) Get(ctx context.Context, scope string) (string, error) {
 	tokStor.mu.Lock()
 	defer tokStor.mu.Unlock()
 
-	if tokStor.tok != nil {
-		timeToRefresh := tokStor.tok.ExpiresAt().Add(-tokStor.refreshBefore)
+	tok, ok := tokStor.tok[scope]
+	if ok {
+		timeToRefresh := tok.ExpiresAt().Add(-tokStor.refreshBefore)
 		if tokStor.timeNow().Before(timeToRefresh) {
 			// we have a token and it's still valid
-			return tokStor.tok.Token, nil
+			return tok.Token, nil
 		}
 		// the token needs to be refreshed
 	} else {
 		// the token was never obtained, get a new one
 	}
 
-	req, err := http.NewRequest("GET", tokStor.tokenURL.String(), nil)
+	u := tokStor.tokenURL
+	dup := url.URL{
+		Scheme:     u.Scheme,
+		Opaque:     u.Opaque,
+		User:       u.User,
+		Host:       u.Host,
+		Path:       u.Path,
+		RawPath:    u.RawPath,
+		ForceQuery: u.ForceQuery,
+		RawQuery:   u.RawQuery,
+		Fragment:   u.Fragment,
+	}
+	if scope != "" {
+		q := dup.Query()
+		q.Add("scope", scope)
+		dup.RawQuery = q.Encode()
+	}
+
+	req, err := http.NewRequest("GET", dup.String(), nil)
 	if err != nil {
 		return "", err
 	}
@@ -395,6 +443,7 @@ func (tokStor *tokenStore) Get(ctx context.Context) (string, error) {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "docker/registry.tokenStore.Get", otext.SpanKindRPCClient)
 	defer span.Finish()
 
+	span = span.SetTag("scope", scope)
 	otext.HTTPMethod.Set(span, req.Method)
 	otext.HTTPUrl.Set(span, req.URL.String())
 
@@ -406,12 +455,12 @@ func (tokStor *tokenStore) Get(ctx context.Context) (string, error) {
 
 	otext.HTTPStatusCode.Set(span, uint16(resp.StatusCode))
 
-	tok := new(token)
+	tok = new(token)
 	if err := json.NewDecoder(resp.Body).Decode(tok); err != nil {
 		otext.Error.Set(span, true)
 		return "", err
 	}
-	tokStor.tok = tok
+	tokStor.tok[scope] = tok
 	return tok.Token, nil
 }
 

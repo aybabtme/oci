@@ -31,6 +31,22 @@ func TestRegistry(t *testing.T) {
 			respCode: 401,
 			respBody: []byte(`{"errors":[{"code":"UNAUTHORIZED","message":"authentication required","detail":null}]}`),
 		},
+
+		{
+			name: "",
+			call: func(t *testing.T, ctx context.Context, reg *Registry) {
+				if img, found, err := reg.GetImageManifest(ctx, "library/nginx", "latest"); err != nil {
+					t.Fatal(err)
+				} else {
+					t.Errorf("found=%+v", found)
+					t.Fatalf("img=%+v", img)
+				}
+			},
+			wantPath: "/",
+			wantBody: nil,
+			respCode: 401,
+			respBody: []byte(`{"errors":[{"code":"UNAUTHORIZED","message":"authentication required","detail":null}]}`),
+		},
 	}
 
 	for _, tt := range tests {
